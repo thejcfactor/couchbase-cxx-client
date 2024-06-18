@@ -18,6 +18,7 @@
 #pragma once
 
 #include "core/config_listener.hxx"
+#include "core/impl/bootstrap_notification_subscriber.hxx"
 #include "core/operations/http_noop.hxx"
 #include "core/service_type.hxx"
 #include "core/tracing/noop_tracer.hxx"
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <optional>
 #include <random>
+#include <queue>
 
 namespace couchbase::core::io
 {
@@ -39,6 +41,7 @@ namespace couchbase::core::io
 class http_session_manager
   : public std::enable_shared_from_this<http_session_manager>
   , public config_listener
+  , public impl::bootstrap_notification_subscriber
 {
 public:
   http_session_manager(std::string client_id, asio::io_context& ctx, asio::ssl::context& tls)
@@ -64,6 +67,21 @@ public:
     return config_.capabilities;
   }
 
+  void notify_bootstrap_error(const impl::bootstrap_error& error) override
+  {
+    CB_LOG_DEBUG(
+      "Handle bootstrap error. code={}, ec_message={}, message={}.",
+      error.ec.value(),
+      error.ec.message(),
+      error.error_message);
+  }
+
+  void notify_bootstrap_success() override
+  {
+    CB_LOG_DEBUG(
+      "Bootstrap was a success.  Should have a config now.");
+  }
+
   void update_config(topology::configuration config) override
   {
     std::scoped_lock config_lock(config_mutex_, sessions_mutex_);
@@ -77,6 +95,7 @@ public:
                                         session->port());
       });
     }
+    drain_deferred_queue();
   }
 
   void set_configuration(const topology::configuration& config, const cluster_options& options)
@@ -92,6 +111,10 @@ public:
     options_ = options;
     next_index_ = next_index;
     config_ = config;
+    if(!configured_){
+      configured_ = true;
+    }
+    drain_deferred_queue();
   }
 
   void export_diag_info(diag::diagnostics_result& res)
@@ -256,6 +279,9 @@ public:
 
   void check_in(service_type type, std::shared_ptr<http_session> session)
   {
+    if (!session) {
+      return;
+    }
     if (!session->is_connected()) {
       CB_LOG_DEBUG("{} HTTP session never connected.  Skipping check-in", session->log_prefix());
       return session.reset();
@@ -302,6 +328,9 @@ public:
                Handler&& handler,
                const couchbase::core::cluster_credentials& credentials)
   {
+    if(!configured_){
+      defer_command(request, std::move(handler), credentials);
+    }
     std::string preferred_node;
     if constexpr (http_traits::supports_sticky_node_v<Request>) {
       if (request.send_to_node) {
@@ -331,10 +360,12 @@ public:
       ctx.path = cmd->encoded.path;
       ctx.http_status = resp.status_code;
       ctx.http_body = resp.body.data();
-      ctx.last_dispatched_from = cmd->session_->local_address();
-      ctx.last_dispatched_to = cmd->session_->remote_address();
-      ctx.hostname = cmd->session_->http_context().hostname;
-      ctx.port = cmd->session_->http_context().port;
+      if(cmd->session_){
+        ctx.last_dispatched_from = cmd->session_->local_address();
+        ctx.last_dispatched_to = cmd->session_->remote_address();
+        ctx.hostname = cmd->session_->http_context().hostname;
+        ctx.port = cmd->session_->http_context().port;
+      }
       handler(cmd->request.make_response(std::move(ctx), std::move(resp)));
       self->check_in(cmd->request.type, cmd->session_);
     });
@@ -432,6 +463,90 @@ private:
     return session;
   }
 
+  template<typename Request, typename Handler>
+  void defer_command(Request request,
+                     Handler&& handler,
+                     const couchbase::core::cluster_credentials& credentials)
+  {
+    auto cmd = std::make_shared<operations::http_command<Request>>(
+      ctx_, request, tracer_, meter_, options_.default_timeout_for(request.type));
+    cmd->start([self = shared_from_this(), cmd, handler = std::forward<Handler>(handler)](
+                 std::error_code ec, io::http_response&& msg) mutable {
+      using command_type = typename decltype(cmd)::element_type;
+      using encoded_response_type = typename command_type::encoded_response_type;
+      using error_context_type = typename command_type::error_context_type;
+      encoded_response_type resp{ std::move(msg) };
+      error_context_type ctx{};
+      ctx.ec = ec;
+      ctx.client_context_id = cmd->client_context_id_;
+      ctx.method = cmd->encoded.method;
+      ctx.path = cmd->encoded.path;
+      ctx.http_status = resp.status_code;
+      ctx.http_body = resp.body.data();
+      if(cmd->session_){
+        ctx.last_dispatched_from = cmd->session_->local_address();
+        ctx.last_dispatched_to = cmd->session_->remote_address();
+        ctx.hostname = cmd->session_->http_context().hostname;
+        ctx.port = cmd->session_->http_context().port;
+      }
+      handler(cmd->request.make_response(std::move(ctx), std::move(resp)));
+      self->check_in(cmd->request.type, cmd->session_);
+    });
+    CB_LOG_DEBUG(
+      R"(Adding HTTP request to deferred queue: {}, method={}, path="{}", client_context_id="{}")",
+      cmd->encoded.type,
+      cmd->encoded.method,
+      cmd->encoded.path,
+      cmd->client_context_id_);
+    std::scoped_lock lock_for_deferred_commands(deferred_commands_mutex_);
+    deferred_commands_.emplace(
+      [self = shared_from_this(),
+       cmd,
+       request,
+       credentials,
+       handler = std::forward<Handler>(handler)]() mutable {
+        // don't do anything if the command has already timed out
+        if (cmd->deadline_expired()) {
+          return;
+        }
+        std::string preferred_node;
+        if constexpr (http_traits::supports_sticky_node_v<Request>) {
+          if (request.send_to_node) {
+            preferred_node = *request.send_to_node;
+          }
+        }
+        auto [error, session] = self->check_out(request.type, credentials, preferred_node);
+        if (error) {
+          typename Request::error_context_type ctx{};
+          ctx.ec = error;
+          using response_type = typename Request::encoded_response_type;
+          return handler(request.make_response(std::move(ctx), response_type{}));
+        }
+        cmd->set_command_session(session);
+        if (!session->is_connected()) {
+          self->connect_then_send(session, cmd, preferred_node);
+        } else {
+          cmd->send_to();
+        }
+      });
+  }
+
+  void drain_deferred_queue()
+  {
+    std::queue<utils::movable_function<void()>> commands{};
+    {
+      std::scoped_lock lock(deferred_commands_mutex_);
+      std::swap(deferred_commands_, commands);
+    }
+    if (!commands.empty()) {
+      CB_LOG_TRACE("Draining deferred operation queue, size={}", commands.size());
+    }
+    while (!commands.empty()) {
+      commands.front()();
+      commands.pop();
+    }
+  }
+
   auto next_node(service_type type) -> std::pair<std::string, std::uint16_t>
   {
     std::scoped_lock lock(config_mutex_);
@@ -491,5 +606,10 @@ private:
   std::mutex next_index_mutex_{};
   std::mutex sessions_mutex_{};
   query_cache query_cache_{};
+
+  std::atomic_bool configured_{ false };
+  std::queue<utils::movable_function<void()>> deferred_commands_{};
+  std::mutex deferred_commands_mutex_{};
+
 };
 } // namespace couchbase::core::io

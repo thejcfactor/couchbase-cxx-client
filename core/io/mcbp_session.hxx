@@ -59,6 +59,7 @@ struct endpoint_diag_info;
 
 namespace impl
 {
+class background_bootstrap_listener;
 class bootstrap_state_listener;
 } // namespace impl
 
@@ -133,6 +134,7 @@ public:
     -> std::optional<key_value_error_map_info>;
   void handle_not_my_vbucket(const io::mcbp_message& msg) const;
   void update_collection_uid(const std::string& path, std::uint32_t uid);
+  void add_background_bootstrap_listener(std::shared_ptr<impl::background_bootstrap_listener> listener);
 
 private:
   std::shared_ptr<mcbp_session_impl> impl_{ nullptr };

@@ -222,6 +222,7 @@ set(couchbase_cxx_client_FILES
     core/io/mcbp_message.cxx
     core/io/mcbp_parser.cxx
     core/io/mcbp_session.cxx
+    core/io/config_tracker.cxx
     core/key_value_config.cxx
     core/management/analytics_link_azure_blob_external.cxx
     core/management/analytics_link_couchbase_remote.cxx

@@ -96,6 +96,12 @@ struct http_command : public std::enable_shared_from_this<http_command<Request>>
       if (ec == asio::error::operation_aborted) {
         return;
       }
+      CB_LOG_DEBUG(
+        R"(HTTP request timed out: {}, method={}, path="{}", client_context_id="{}")",
+        self->encoded.type,
+        self->encoded.method,
+        self->encoded.path,
+        self->client_context_id_);
       if constexpr (io::http_traits::supports_readonly_v<Request>) {
         if (self->request.readonly) {
           self->cancel(errc::common::unambiguous_timeout);

@@ -24,6 +24,7 @@
 #include "core/impl/get_replica.hxx"
 #include "core/impl/lookup_in_replica.hxx"
 #include "core/impl/observe_seqno.hxx"
+#include "core/io/config_tracker.hxx"
 #include "core/io/http_command.hxx"
 #include "core/io/http_session_manager.hxx"
 #include "core/io/mcbp_command.hxx"
@@ -154,6 +155,7 @@ public:
     : ctx_(ctx)
     , work_(asio::make_work_guard(ctx_))
     , session_manager_(std::make_shared<io::http_session_manager>(id_, ctx_, tls_))
+    , retry_backoff_(ctx_)
   {
   }
 
@@ -273,6 +275,58 @@ public:
         }));
     }
     do_open(std::move(handler));
+  }
+
+  void open_in_background(couchbase::core::origin origin, utils::movable_function<void(std::error_code)>&& handler)
+  {
+    if (stopped_) {
+      return handler(errc::network::cluster_closed);
+    }
+    if(background_open_started_){
+      CB_LOG_DEBUG("Background open already started for cluster, id: \"{}\"", id_);
+      return handler({});
+    }
+    if (origin.get_nodes().empty()) {
+      stopped_ = true;
+      work_.reset();
+      return handler(errc::common::invalid_argument);
+    }
+
+    origin_ = std::move(origin);
+    CB_LOG_DEBUG(R"(open cluster, id: "{}", core version: "{}", {})",
+                 id_, couchbase::core::meta::sdk_semver(),
+                 origin_.to_json());
+    // ignore the enable_tracing flag if a tracer was passed in
+    if (nullptr != origin_.options().tracer) {
+      tracer_ = origin_.options().tracer;
+    } else {
+      if (origin_.options().enable_tracing) {
+        tracer_ = std::make_shared<tracing::threshold_logging_tracer>(ctx_, origin_.options().tracing_options);
+      } else {
+        tracer_ = std::make_shared<tracing::noop_tracer>();
+      }
+    }
+    tracer_->start();
+    // ignore the metrics options if a meter was passed in.
+    if (nullptr != origin_.options().meter) {
+      meter_ = origin_.options().meter;
+    } else {
+      if (origin_.options().enable_metrics) {
+        meter_ = std::make_shared<metrics::logging_meter>(ctx_, origin_.options().metrics_options);
+      } else {
+        meter_ = std::make_shared<metrics::noop_meter>();
+      }
+    }
+    meter_->start();
+    session_manager_->set_tracer(tracer_);
+    // at this point we will infinitely try to connect
+    if (origin_.options().enable_dns_srv) {
+      do_background_dns_srv_open();
+    } else {
+      do_background_open();
+    }
+    background_open_started_ = true;
+    return handler({});
   }
 
   void open_bucket(const std::string& bucket_name,
@@ -653,6 +707,241 @@ public:
     });
   }
 
+  void do_background_open()
+  {
+    // Warn users if idle_http_connection_timeout is too close to server idle timeouts
+    if (origin_.options().idle_http_connection_timeout > std::chrono::milliseconds(4'500)) {
+      CB_LOG_INFO("[{}]: The SDK may produce trivial warnings due to the idle HTTP connection "
+                  "timeout being set above the idle"
+                  "timeout of various services",
+                  id_);
+    }
+
+    // Warn users if they attempt to use Capella without TLS being enabled.
+    bool has_capella_host = false;
+    {
+      bool has_non_capella_host = false;
+      static std::string suffix = "cloud.couchbase.com";
+      for (const auto& node : origin_.get_hostnames()) {
+        if (auto pos = node.find(suffix);
+            pos != std::string::npos && pos + suffix.size() == node.size()) {
+          has_capella_host = true;
+        } else {
+          has_non_capella_host = true;
+        }
+      }
+
+      if (has_capella_host && !origin_.options().enable_tls) {
+        CB_LOG_WARNING("[{}]: TLS is required when connecting to Couchbase Capella. Please enable "
+                       "TLS by prefixing "
+                       "the connection string with \"couchbases://\" (note the final 's').",
+                       id_);
+      }
+
+      if (origin_.options().enable_tls /* TLS is enabled */
+          && origin_.options()
+               .trust_certificate.empty() /* No CA certificate (or other SDK-specific trust source) is specified */
+          && origin_.options().trust_certificate_value.empty()     /* and certificate value has not been specified */
+          && origin_.options().tls_verify != tls_verify_mode::none /* The user did not disable all TLS verification */
+          &&
+          has_non_capella_host /* The connection string has a hostname that does NOT end in ".cloud.couchbase.com" */) {
+        CB_LOG_WARNING("[{}] When TLS is enabled, the cluster options must specify certificate(s) "
+                       "to trust or ensure that they are "
+                       "available in system CA store. (Unless connecting to cloud.couchbase.com.)",
+                       id_);
+      }
+    }
+
+    if (origin_.options().enable_tls) {
+      configure_tls_options(has_capella_host);
+
+      if (origin_.options().trust_certificate.empty() &&
+          origin_.options()
+            .trust_certificate_value.empty()) { // trust certificate is not explicitly specified
+        CB_LOG_DEBUG(R"([{}]: use default CA for TLS verify)", id_);
+        std::error_code ec{};
+
+        // load system certificates
+        tls_.set_default_verify_paths(ec);
+        if (ec) {
+          CB_LOG_WARNING(R"([{}]: failed to load system CAs: {})", id_, ec.message());
+        }
+
+        // add the Capella Root CA in addition to system CAs
+        tls_.add_certificate_authority(
+          asio::const_buffer(couchbase::core::default_ca::capellaCaCert,
+                             strlen(couchbase::core::default_ca::capellaCaCert)),
+          ec);
+        if (ec) {
+          CB_LOG_WARNING("[{}]: unable to load default CAs: {}", id_, ec.message());
+          // we don't consider this fatal and try to continue without it
+        }
+
+        if (const auto certificates = default_ca::mozilla_ca_certs();
+            !origin_.options().disable_mozilla_ca_certificates && !certificates.empty()) {
+          CB_LOG_DEBUG("[{}]: loading {} CA certificates from Mozilla bundle. Update date: \"{}\", "
+                       "SHA256: \"{}\"",
+                       id_,
+                       certificates.size(),
+                       default_ca::mozilla_ca_certs_date(),
+                       default_ca::mozilla_ca_certs_sha256());
+          for (const auto& cert : certificates) {
+            tls_.add_certificate_authority(asio::const_buffer(cert.body.data(), cert.body.size()),
+                                           ec);
+            if (ec) {
+              CB_LOG_WARNING("[{}]: unable to load CA \"{}\" from Mozilla bundle: {}",
+                             id_,
+                             cert.authority,
+                             ec.message());
+            }
+          }
+        }
+      } else { // trust certificate is explicitly specified
+        std::error_code ec{};
+        // load only the explicit certificate
+        // system and default capella certificates are not loaded
+        if (!origin_.options().trust_certificate_value.empty()) {
+          CB_LOG_DEBUG(R"([{}]: use TLS certificate passed through via options object)", id_);
+          tls_.add_certificate_authority(
+            asio::const_buffer(origin_.options().trust_certificate_value.data(),
+                               origin_.options().trust_certificate_value.size()),
+            ec);
+          if (ec) {
+            CB_LOG_WARNING(
+              "[{}]: unable to load CA passed via options object: {}", id_, ec.message());
+          }
+        }
+        if (!origin_.options().trust_certificate.empty()) {
+          CB_LOG_DEBUG(
+            R"([{}]: use TLS verify file: "{}")", id_, origin_.options().trust_certificate);
+          tls_.load_verify_file(origin_.options().trust_certificate, ec);
+          if (ec) {
+            CB_LOG_ERROR("[{}]: unable to load verify file \"{}\": {}",
+                         id_,
+                         origin_.options().trust_certificate,
+                         ec.message());
+            auto backoff = std::chrono::milliseconds(500);
+            CB_LOG_DEBUG("[{}] waiting for {}ms before retrying TLS verify file.",
+                         id_,
+                         backoff.count());
+            backoff_then_retry(backoff, [self = shared_from_this()](){
+                self->do_background_open();
+            });
+          }
+        }
+      }
+      if (origin_.credentials().uses_certificate()) {
+        std::error_code ec{};
+        CB_LOG_DEBUG(R"([{}]: use TLS certificate chain: "{}")", id_, origin_.certificate_path());
+        tls_.use_certificate_chain_file(origin_.certificate_path(), ec);
+        if (ec) {
+          CB_LOG_ERROR("[{}]: unable to load certificate chain \"{}\": {}",
+                       id_,
+                       origin_.certificate_path(),
+                       ec.message());
+          auto backoff = std::chrono::milliseconds(500);
+          CB_LOG_DEBUG("[{}] waiting for {}ms before retrying TLS certificate chain.",
+                        id_,
+                        backoff.count());
+          backoff_then_retry(backoff, [self = shared_from_this()](){
+              self->do_background_open();
+          });
+        }
+        CB_LOG_DEBUG(R"([{}]: use TLS private key: "{}")", id_, origin_.key_path());
+        tls_.use_private_key_file(origin_.key_path(), asio::ssl::context::file_format::pem, ec);
+        if (ec) {
+          CB_LOG_ERROR(
+            "[{}]: unable to load private key \"{}\": {}", id_, origin_.key_path(), ec.message());
+          auto backoff = std::chrono::milliseconds(500);
+          CB_LOG_DEBUG("[{}] waiting for {}ms before retrying TLS private key.",
+                        id_,
+                        backoff.count());
+          backoff_then_retry(backoff, [self = shared_from_this()](){
+              self->do_background_open();
+          });
+        }
+      }
+    }
+    config_tracker_ =
+      std::make_shared<couchbase::core::io::cluster_config_tracker>(id_,
+                                                                    origin_,
+                                                                    ctx_,
+                                                                    tls_,
+                                                                    dns_srv_tracker_);
+    config_tracker_->register_bootstrap_notification_subscriber(session_manager_);
+    create_cluster_sessions();
+  }
+
+  void backoff_then_retry(std::chrono::milliseconds backoff,
+                          utils::movable_function<void()> callback){
+    retry_backoff_.expires_after(backoff);
+    retry_backoff_.async_wait(
+      [self = shared_from_this(), cb = std::move(callback)](std::error_code ec) {
+        if (ec == asio::error::operation_aborted || self->stopped_) {
+          return;
+        }
+        if (ec) {
+          CB_LOG_WARNING("[{}] Retry callback received error ec={}.", self->id_, ec.message());
+        }
+        cb();
+      });
+    return;
+  }
+
+  void do_background_dns_srv_open()
+  {
+    std::string hostname;
+    std::string port;
+    std::tie(hostname, port) = origin_.next_address();
+    dns_srv_tracker_ = std::make_shared<impl::dns_srv_tracker>(ctx_,
+                                                               hostname,
+                                                               origin_.options().dns_config,
+                                                               origin_.options().enable_tls);
+    return asio::post(asio::bind_executor(ctx_,
+      [self = shared_from_this(), hostname = std::move(hostname)]() mutable {
+        return self->dns_srv_tracker_->get_srv_nodes(
+          [self, hostname = std::move(hostname)](origin::node_list nodes,
+                                                 std::error_code ec) mutable {
+            if (ec) {
+                auto backoff = std::chrono::milliseconds(500);
+                CB_LOG_DEBUG("[{}] waiting for {}ms before retrying DNS query.", self->id_, backoff.count());
+                self->backoff_then_retry(backoff, [self](){
+                    self->do_background_dns_srv_open();
+                });
+                return;
+            }
+            if (!nodes.empty()) {
+                self->origin_.set_nodes(std::move(nodes));
+                CB_LOG_INFO("[{}] Replace list of bootstrap nodes with addresses from DNS SRV of \"{}\": [{}]",
+                            self->id_,
+                            hostname,
+                            utils::join_strings(self->origin_.get_nodes(), ", "));
+            }
+            return self->do_background_open();
+        });
+      }
+    ));
+  }
+
+  void create_cluster_sessions(){
+    config_tracker_->create_sessions(
+      [self = shared_from_this()](std::error_code ec, topology::configuration cfg) mutable {
+        if(ec){
+          auto backoff = std::chrono::milliseconds(500);
+          CB_LOG_DEBUG("[{}] Waiting for {}ms before retrying to create cluster sessions.",
+                       self->id_,
+                       backoff.count());
+          self->backoff_then_retry(backoff, [self](){
+            self->create_cluster_sessions();
+          });
+        } else {
+          self->session_manager_->set_configuration(cfg, self->origin_.options());
+          self->config_tracker_->on_configuration_update(self->session_manager_);
+          self->config_tracker_->register_state_listener();
+        }
+      });
+  }
+
   void with_bucket_configuration(
     const std::string& bucket_name,
     utils::movable_function<void(std::error_code, topology::configuration)>&& handler)
@@ -759,6 +1048,12 @@ public:
           self->session_->stop(retry_reason::do_not_retry);
           self->session_.reset();
         }
+        if(self->config_tracker_){
+          self->config_tracker_->close();
+          self->config_tracker_->unregister_bootstrap_notification_subscriber(
+                                  self->session_manager_);
+        }
+        self->retry_backoff_.cancel();
         self->for_each_bucket([](auto bucket) {
           bucket->close();
         });
@@ -839,6 +1134,9 @@ private:
   std::shared_ptr<couchbase::tracing::request_tracer> tracer_{ nullptr };
   std::shared_ptr<couchbase::metrics::meter> meter_{ nullptr };
   std::atomic_bool stopped_{ false };
+  std::shared_ptr<couchbase::core::io::cluster_config_tracker> config_tracker_{};
+  asio::steady_timer retry_backoff_;
+  std::atomic_bool background_open_started_{ false };
 };
 
 cluster::cluster(asio::io_context& ctx)
@@ -891,6 +1189,15 @@ cluster::open(couchbase::core::origin origin,
 {
   if (impl_) {
     impl_->open(std::move(origin), std::move(handler));
+  }
+}
+
+void
+cluster::open_in_background(couchbase::core::origin origin,
+                            utils::movable_function<void(std::error_code)>&& handler) const
+{
+  if (impl_) {
+    impl_->open_in_background(std::move(origin), std::move(handler));
   }
 }
 
