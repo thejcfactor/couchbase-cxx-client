@@ -19,6 +19,8 @@ name: big-endian
 
 on:
   workflow_dispatch:
+  push:
+    branches: [big-endian-ci-test]
 
 permissions:
   contents: read
